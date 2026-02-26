@@ -12,7 +12,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from utils import adapt_instructions_file, ensure_https
+from utils import adapt_instructions_file, ensure_https, resolve_databricks_host_and_token
 
 # Set HOME if not properly set
 if not os.environ.get("HOME") or os.environ["HOME"] == "/":
@@ -20,22 +20,21 @@ if not os.environ.get("HOME") or os.environ["HOME"] == "/":
 
 home = Path(os.environ["HOME"])
 
-host = os.environ.get("DATABRICKS_HOST", "")
-token = os.environ.get("DATABRICKS_TOKEN", "")
+host, token = resolve_databricks_host_and_token()
 codex_model = os.environ.get("CODEX_MODEL", "databricks-gpt-5-2")
 
 if not host or not token:
-    print("Warning: DATABRICKS_HOST or DATABRICKS_TOKEN not set, skipping Codex CLI config")
-    exit(0)
+    print("Error: DATABRICKS_HOST or auth token not available, cannot configure Codex CLI")
+    raise SystemExit(1)
 
 # Strip trailing slash and ensure https:// prefix
 host = ensure_https(host.rstrip("/"))
 
 # Use DATABRICKS_GATEWAY_HOST if available (new AI Gateway), otherwise fall back to DATABRICKS_HOST
 gateway_host = ensure_https(os.environ.get("DATABRICKS_GATEWAY_HOST", "").rstrip("/"))
-gateway_token = os.environ.get("DATABRICKS_TOKEN", "") if gateway_host else ""
+gateway_token = token if gateway_host else ""
 if gateway_host and not gateway_token:
-    print("Warning: DATABRICKS_GATEWAY_HOST set but DATABRICKS_TOKEN missing, falling back to DATABRICKS_HOST")
+    print("Warning: DATABRICKS_GATEWAY_HOST set but token unavailable, falling back to DATABRICKS_HOST")
     gateway_host = ""
 
 if gateway_host:
@@ -65,7 +64,8 @@ if not codex_bin.exists():
     if result.returncode == 0:
         print(f"Codex CLI installed to {codex_bin}")
     else:
-        print(f"Codex CLI install warning: {result.stderr}")
+        print(f"Codex CLI install failed: {result.stderr}")
+        raise SystemExit(1)
 else:
     print(f"Codex CLI already installed at {codex_bin}")
 

@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from utils import ensure_https
+from utils import resolve_databricks_host_and_token
 
 # Set HOME if not properly set
 if not os.environ.get("HOME") or os.environ["HOME"] == "/":
@@ -12,15 +12,12 @@ if not os.environ.get("HOME") or os.environ["HOME"] == "/":
 
 home = Path(os.environ["HOME"])
 
-# Get credentials from environment
-host = os.environ.get("DATABRICKS_HOST")
-token = os.environ.get("DATABRICKS_TOKEN")
+# Get credentials from environment or SDK auto-auth fallback
+host, token = resolve_databricks_host_and_token()
 
 if not host or not token:
-    print("Warning: DATABRICKS_HOST or DATABRICKS_TOKEN not set, skipping CLI config")
-    exit(0)
-
-host = ensure_https(host)
+    print("Error: DATABRICKS_HOST or auth token not available, cannot configure Databricks CLI")
+    raise SystemExit(1)
 
 # Create ~/.databrickscfg with DEFAULT profile using PAT auth
 databrickscfg = home / ".databrickscfg"
@@ -38,12 +35,6 @@ result = subprocess.run(
     ["databricks", "current-user", "me", "--output", "json"],
     capture_output=True,
     text=True,
-    env={
-        **os.environ,
-        # Remove OAuth vars to force PAT auth
-        "DATABRICKS_CLIENT_ID": "",
-        "DATABRICKS_CLIENT_SECRET": ""
-    }
 )
 
 if result.returncode == 0:

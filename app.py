@@ -11,10 +11,11 @@ import signal
 import time
 import copy
 import logging
+import sys
 from flask import Flask, send_from_directory, request, jsonify, session
 from collections import deque
 
-from utils import ensure_https
+from utils import ensure_https, resolve_auth, AuthMode, TokenRefresher
 
 # Session timeout configuration
 SESSION_TIMEOUT_SECONDS = 60        # No poll for 60s = dead session
@@ -66,6 +67,8 @@ def _get_setup_state_snapshot():
 
 # Single-user security: only the token owner can access the terminal
 app_owner = None
+# Token refresher for OAuth M2M mode
+token_refresher = None
 
 
 def _run_step(step_id, command):
@@ -74,8 +77,6 @@ def _run_step(step_id, command):
         env = os.environ.copy()
         if not env.get("HOME") or env["HOME"] == "/":
             env["HOME"] = "/app/python/source_code"
-        env.pop("DATABRICKS_CLIENT_ID", None)
-        env.pop("DATABRICKS_CLIENT_SECRET", None)
 
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
@@ -95,20 +96,17 @@ def _setup_git_config():
     if not home or home == "/":
         home = "/app/python/source_code"
 
-    # Get user identity from Databricks token
+    # Get user identity from Databricks credentials (PAT or OAuth M2M)
     user_email = None
     display_name = None
     try:
         from databricks.sdk import WorkspaceClient
-        db_host = ensure_https(os.environ.get("DATABRICKS_HOST", ""))
-        db_token = os.environ.get("DATABRICKS_TOKEN")
-        if db_host and db_token:
-            w = WorkspaceClient(host=db_host, token=db_token, auth_type="pat")
-            me = w.current_user.me()
-            user_email = me.user_name
-            display_name = me.display_name or user_email.split("@")[0]
+        w = WorkspaceClient()
+        me = w.current_user.me()
+        user_email = me.user_name
+        display_name = me.display_name or user_email.split("@")[0]
     except Exception as e:
-        logger.warning(f"Could not get user identity from token: {e}")
+        logger.warning(f"Could not get user identity: {e}")
 
     # Write ~/.gitconfig directly (more reliable than subprocess git config)
     gitconfig_path = os.path.join(home, ".gitconfig")
@@ -183,11 +181,13 @@ def run_setup():
 
     _run_step("micro", ["bash", "-c",
         "mkdir -p ~/.local/bin && bash install_micro.sh && mv micro ~/.local/bin/ 2>/dev/null || true"])
-    _run_step("claude", ["python", "setup_claude.py"])
-    _run_step("codex", ["python", "setup_codex.py"])
-    _run_step("opencode", ["python", "setup_opencode.py"])
-    _run_step("gemini", ["python", "setup_gemini.py"])
-    _run_step("databricks", ["python", "setup_databricks.py"])
+    # Use the currently running interpreter instead of assuming `python` exists in PATH.
+    py = sys.executable or "python"
+    _run_step("claude", [py, "setup_claude.py"])
+    _run_step("codex", [py, "setup_codex.py"])
+    _run_step("opencode", [py, "setup_opencode.py"])
+    _run_step("gemini", [py, "setup_gemini.py"])
+    _run_step("databricks", [py, "setup_databricks.py"])
 
     with setup_lock:
         any_error = any(s["status"] == "error" for s in setup_state["steps"])
@@ -195,15 +195,21 @@ def run_setup():
         setup_state["completed_at"] = time.time()
 
 
-def get_token_owner():
-    """Get the owner email from DATABRICKS_TOKEN at startup."""
+def _get_app_owner(auth):
+    """Get the owner email for authorization.
+
+    PAT mode: returns user email (existing behavior).
+    OAuth M2M mode: returns None - Databricks Apps proxy handles access control.
+    """
+    if auth.mode == AuthMode.OAUTH_M2M:
+        logger.info("OAuth M2M mode: authorization delegated to Databricks Apps proxy")
+        return None
+
     try:
         from databricks.sdk import WorkspaceClient
-        host = ensure_https(os.environ.get("DATABRICKS_HOST", ""))
-        token = os.environ.get("DATABRICKS_TOKEN")
-        if not host or not token:
+        if not auth.host or not auth.token:
             return None
-        w = WorkspaceClient(host=host, token=token, auth_type="pat")
+        w = WorkspaceClient(host=auth.host, token=auth.token, auth_type="pat")
         return w.current_user.me().user_name
     except Exception as e:
         logger.warning(f"Could not determine token owner: {e}")
@@ -381,6 +387,10 @@ def create_session():
         local_bin = f"{shell_env['HOME']}/.local/bin"
         shell_env["PATH"] = f"{local_bin}:{shell_env.get('PATH', '')}"
 
+        # Inject fresh token from TokenRefresher (OAuth M2M keeps tokens current)
+        if token_refresher is not None:
+            shell_env["DATABRICKS_TOKEN"] = token_refresher.current_token
+
         # Start shell in ~/projects/ directory
         projects_dir = os.path.join(shell_env["HOME"], "projects")
         os.makedirs(projects_dir, exist_ok=True)
@@ -499,15 +509,23 @@ def close_session():
 
 
 def initialize_app():
-    """One-time init: detect owner, start cleanup thread."""
-    global app_owner
+    """One-time init: resolve auth, detect owner, start cleanup + token refresh."""
+    global app_owner, token_refresher
 
-    # Remove OAuth credentials - force PAT auth only
-    os.environ.pop("DATABRICKS_CLIENT_ID", None)
-    os.environ.pop("DATABRICKS_CLIENT_SECRET", None)
+    # Resolve authentication (PAT or OAuth M2M)
+    auth = resolve_auth()
+    logger.info(f"Auth resolved: mode={auth.mode.value}, host={auth.host}")
 
-    # Determine app owner from DATABRICKS_TOKEN
-    app_owner = get_token_owner()
+    # Set DATABRICKS_TOKEN env var so setup scripts and subprocesses can use it
+    if auth.token:
+        os.environ["DATABRICKS_TOKEN"] = auth.token
+
+    # Start token refresher (only active in OAuth M2M mode)
+    token_refresher = TokenRefresher(auth)
+    token_refresher.start()
+
+    # Determine app owner
+    app_owner = _get_app_owner(auth)
     if app_owner:
         logger.info(f"App owner (from token): {app_owner}")
     else:

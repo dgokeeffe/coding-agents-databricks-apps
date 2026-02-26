@@ -3,7 +3,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from utils import ensure_https
+from utils import ensure_https, resolve_databricks_host_and_token
 
 # Set HOME if not properly set
 if not os.environ.get("HOME") or os.environ["HOME"] == "/":
@@ -18,20 +18,20 @@ claude_dir.mkdir(exist_ok=True)
 # 1. Write settings.json for Databricks model serving
 # Use DATABRICKS_GATEWAY_HOST if available (new AI Gateway), otherwise fall back to DATABRICKS_HOST
 gateway_host = ensure_https(os.environ.get("DATABRICKS_GATEWAY_HOST", "").rstrip("/"))
-databricks_host = ensure_https(os.environ.get("DATABRICKS_HOST", "").rstrip("/"))
+databricks_host, auth_token = resolve_databricks_host_and_token()
 
-gateway_token = os.environ.get("DATABRICKS_TOKEN", "") if gateway_host else ""
-if gateway_host and not gateway_token:
-    print("Warning: DATABRICKS_GATEWAY_HOST set but DATABRICKS_TOKEN missing, falling back to DATABRICKS_HOST")
+if gateway_host and not auth_token:
+    print("Warning: DATABRICKS_GATEWAY_HOST set but token unavailable, falling back to DATABRICKS_HOST")
     gateway_host = ""
 
 if gateway_host:
     anthropic_base_url = f"{gateway_host}/anthropic"
-    auth_token = gateway_token
     print(f"Using Databricks AI Gateway: {gateway_host}")
 else:
+    if not databricks_host or not auth_token:
+        print("Error: could not resolve Databricks host/token for Claude setup")
+        raise SystemExit(1)
     anthropic_base_url = f"{databricks_host}/serving-endpoints/anthropic"
-    auth_token = os.environ["DATABRICKS_TOKEN"]
     print(f"Using Databricks Host: {databricks_host}")
 
 settings = {
@@ -82,7 +82,8 @@ if not claude_bin.exists():
     if result.returncode == 0:
         print("Claude Code CLI installed successfully")
     else:
-        print(f"CLI install warning: {result.stderr}")
+        print(f"CLI install failed: {result.stderr}")
+        raise SystemExit(1)
 else:
     print(f"Claude Code CLI already installed at {claude_bin}")
 

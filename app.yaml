@@ -4,8 +4,10 @@ command:
 env:
   - name: HOME
     value: /app/python/source_code
-  - name: DATABRICKS_TOKEN
-    valueFrom: DATABRICKS_TOKEN
+  # DATABRICKS_TOKEN: set this secret for PAT auth. If not set, the app uses
+  # auto-provisioned OAuth M2M credentials (DATABRICKS_CLIENT_ID/SECRET).
+  # - name: DATABRICKS_TOKEN
+  #   valueFrom: DATABRICKS_TOKEN
   - name: ANTHROPIC_MODEL
     value: databricks-claude-opus-4-6
   - name: GEMINI_MODEL

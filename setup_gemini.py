@@ -16,7 +16,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from utils import adapt_instructions_file, ensure_https
+from utils import adapt_instructions_file, ensure_https, resolve_databricks_host_and_token
 
 # Set HOME if not properly set
 if not os.environ.get("HOME") or os.environ["HOME"] == "/":
@@ -24,22 +24,21 @@ if not os.environ.get("HOME") or os.environ["HOME"] == "/":
 
 home = Path(os.environ["HOME"])
 
-host = os.environ.get("DATABRICKS_HOST", "")
-token = os.environ.get("DATABRICKS_TOKEN", "")
+host, token = resolve_databricks_host_and_token()
 gemini_model = os.environ.get("GEMINI_MODEL", "databricks-gemini-3-1-pro")
 
 if not host or not token:
-    print("Warning: DATABRICKS_HOST or DATABRICKS_TOKEN not set, skipping Gemini CLI config")
-    exit(0)
+    print("Error: DATABRICKS_HOST or auth token not available, cannot configure Gemini CLI")
+    raise SystemExit(1)
 
 # Strip trailing slash and ensure https:// prefix
 host = ensure_https(host.rstrip("/"))
 
 # Use DATABRICKS_GATEWAY_HOST if available (new AI Gateway), otherwise fall back to DATABRICKS_HOST
 gateway_host = ensure_https(os.environ.get("DATABRICKS_GATEWAY_HOST", "").rstrip("/"))
-gateway_token = os.environ.get("DATABRICKS_TOKEN", "") if gateway_host else ""
+gateway_token = token if gateway_host else ""
 if gateway_host and not gateway_token:
-    print("Warning: DATABRICKS_GATEWAY_HOST set but DATABRICKS_TOKEN missing, falling back to DATABRICKS_HOST")
+    print("Warning: DATABRICKS_GATEWAY_HOST set but token unavailable, falling back to DATABRICKS_HOST")
     gateway_host = ""
 
 if gateway_host:
@@ -68,7 +67,8 @@ if not gemini_bin.exists():
     if result.returncode == 0:
         print(f"Gemini CLI installed to {gemini_bin}")
     else:
-        print(f"Gemini CLI install warning: {result.stderr}")
+        print(f"Gemini CLI install failed: {result.stderr}")
+        raise SystemExit(1)
 else:
     print(f"Gemini CLI already installed at {gemini_bin}")
 

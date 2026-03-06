@@ -222,8 +222,12 @@
         await new Promise(r => requestAnimationFrame(r));
         this.fitAddon.fit();
 
-        // Create PTY session
-        const resp = await fetch('/api/session', { method: 'POST' });
+        // Create PTY session (pane_id maps to a persistent tmux session)
+        const resp = await fetch('/api/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pane_id: this.slotIndex })
+        });
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
         this.sessionId = data.session_id;
@@ -232,7 +236,7 @@
         // Send initial size
         await this.sendResize();
 
-        // Greeting
+        // Greeting (only shown for new sessions, tmux reattach will redraw existing content)
         this.term.write('\x1b[32mConnected. Type "claude" to start coding.\x1b[0m\r\n');
         this.term.write('\x1b[90mRun "gh auth login" to connect GitHub, then clone your repos into ~/projects.\x1b[0m\r\n\r\n');
 

@@ -11,6 +11,7 @@ import signal
 import time
 import copy
 import logging
+import shutil
 import sys
 from flask import Flask, send_from_directory, request, jsonify, session
 from collections import deque
@@ -44,6 +45,7 @@ setup_state = {
         {"id": "git",        "label": "Configuring git identity",     "status": "pending", "started_at": None, "completed_at": None, "error": None},
         {"id": "micro",      "label": "Installing micro editor",      "status": "pending", "started_at": None, "completed_at": None, "error": None},
         {"id": "gh",         "label": "Installing GitHub CLI",        "status": "pending", "started_at": None, "completed_at": None, "error": None},
+        {"id": "tmux",       "label": "Installing tmux",              "status": "pending", "started_at": None, "completed_at": None, "error": None},
         {"id": "claude",     "label": "Configuring Claude CLI",       "status": "pending", "started_at": None, "completed_at": None, "error": None},
         {"id": "codex",      "label": "Configuring Codex CLI",        "status": "pending", "started_at": None, "completed_at": None, "error": None},
         {"id": "opencode",   "label": "Configuring OpenCode CLI",     "status": "pending", "started_at": None, "completed_at": None, "error": None},
@@ -233,6 +235,15 @@ def _setup_git_config():
         f.write('# Source .bashrc for login shells\n')
         f.write('[ -f ~/.bashrc ] && . ~/.bashrc\n')
 
+    # Configure tmux: use login bash, enable 256-color, increase scrollback
+    tmux_conf_path = os.path.join(home, ".tmux.conf")
+    with open(tmux_conf_path, "w") as f:
+        f.write('set -g default-shell /bin/bash\n')
+        f.write('set -g default-command "/bin/bash --login"\n')
+        f.write('set -g default-terminal "xterm-256color"\n')
+        f.write('set -g history-limit 10000\n')
+        f.write('set -g mouse on\n')
+
 
 def _clone_git_repos():
     """Clone repos listed in GIT_REPOS env var into ~/projects/."""
@@ -297,6 +308,8 @@ def run_setup():
 
     _run_step("micro", ["bash", "-c",
         "mkdir -p ~/.local/bin && bash install_micro.sh && mv micro ~/.local/bin/ 2>/dev/null || true"])
+    _run_step("tmux", ["bash", "-c",
+        "which tmux >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq tmux >/dev/null 2>&1)"])
     _run_step("gh", ["bash", "-c",
         'GH_VERSION="2.74.1" && '
         'mkdir -p ~/.local/bin && '
@@ -517,6 +530,9 @@ def health():
 def create_session():
     """Create a new terminal session."""
     try:
+        data = request.json or {}
+        pane_id = int(data.get("pane_id", 0))
+
         master_fd, slave_fd = pty.openpty()
         # Set up environment for the shell
         shell_env = os.environ.copy()
@@ -536,8 +552,16 @@ def create_session():
         projects_dir = os.path.join(shell_env["HOME"], "projects")
         os.makedirs(projects_dir, exist_ok=True)
 
+        # Use tmux for session persistence across page refreshes.
+        # tmux new-session -A: attach if session exists, create if not.
+        tmux_session = f"pane-{pane_id}"
+        if shutil.which("tmux"):
+            shell_cmd = ["tmux", "new-session", "-A", "-s", tmux_session]
+        else:
+            shell_cmd = ["/bin/bash", "--login"]
+
         pid = subprocess.Popen(
-            ["/bin/bash", "--login"],
+            shell_cmd,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,

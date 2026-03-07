@@ -26,32 +26,6 @@ CLEANUP_INTERVAL_SECONDS = 30  # How often to check for stale sessions
 GRACEFUL_SHUTDOWN_WAIT = 3  # Seconds to wait after SIGHUP before SIGKILL
 
 
-# Simple in-memory rate limiter
-class RateLimiter:
-    """Token-bucket rate limiter per IP address."""
-
-    def __init__(self, rate=10, per=1.0, burst=20):
-        self._rate = rate
-        self._per = per
-        self._burst = burst
-        self._tokens = {}  # ip -> (tokens, last_time)
-        self._lock = threading.Lock()
-
-    def allow(self, key):
-        now = time.time()
-        with self._lock:
-            tokens, last = self._tokens.get(key, (self._burst, now))
-            elapsed = now - last
-            tokens = min(self._burst, tokens + elapsed * (self._rate / self._per))
-            if tokens >= 1:
-                self._tokens[key] = (tokens - 1, now)
-                return True
-            self._tokens[key] = (tokens, now)
-            return False
-
-
-rate_limiter = RateLimiter(rate=10, per=1.0, burst=20)
-
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -718,12 +692,6 @@ def authorize_request():
                 "message": f"This app belongs to {app_owner}. You are logged in as {user}.",
             }
         ), 403
-
-    # Rate limit API endpoints
-    if request.path.startswith("/api/") and request.path != "/api/setup-status":
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-        if not rate_limiter.allow(client_ip):
-            return jsonify({"error": "Rate limit exceeded"}), 429
 
     return None
 

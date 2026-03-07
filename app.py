@@ -301,6 +301,15 @@ def run_setup():
         setup_state["status"] = "running"
         setup_state["started_at"] = time.time()
 
+    # Ensure ~/.local/bin is in the server process PATH so shutil.which() finds
+    # binaries installed during setup (tmux, gh, micro, etc.)
+    home = os.environ.get("HOME", "/app/python/source_code")
+    if not home or home == "/":
+        home = "/app/python/source_code"
+    local_bin = os.path.join(home, ".local", "bin")
+    if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{local_bin}:{os.environ.get('PATH', '')}"
+
     # Git config — done directly in Python, not as a subprocess
     _update_step("git", status="running", started_at=time.time())
     try:

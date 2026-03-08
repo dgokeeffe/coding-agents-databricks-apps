@@ -154,15 +154,41 @@ if not opencode_bin.exists():
     # Copy binary to ~/.local/bin
     import shutil
 
-    shutil.copy2(str(expected_bin), str(opencode_bin))
+    # Install real binary as _opencode_real, create wrapper to strip OAuth vars
+    opencode_real = local_bin / "_opencode_real"
+    shutil.copy2(str(expected_bin), str(opencode_real))
+    opencode_real.chmod(0o755)
+
+    # Write wrapper that strips OAuth M2M vars before exec'ing the real binary.
+    # Databricks Apps injects both PAT and OAuth M2M env vars, causing the
+    # Databricks SDK to reject with "more than one authorization method".
+    opencode_bin.write_text(
+        "#!/bin/sh\n"
+        "unset DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET\n"
+        'exec "$(dirname "$0")/_opencode_real" "$@"\n'
+    )
     opencode_bin.chmod(0o755)
-    logger.info(f"  OpenCode CLI installed to {opencode_bin}")
+    logger.info(f"  OpenCode CLI installed to {opencode_bin} (wrapper + _opencode_real)")
 
     # Clean up build directory to save space
     logger.info("  Cleaning up build directory...")
     subprocess.run(["rm", "-rf", str(build_dir)], check=True)
 else:
     logger.info(f"OpenCode CLI already installed at {opencode_bin}")
+    # Ensure wrapper exists even if binary was cached from previous deploy
+    opencode_real = local_bin / "_opencode_real"
+    if not opencode_real.exists() and opencode_bin.exists():
+        # Binary exists but no wrapper — convert to wrapper pattern
+        import shutil as _shutil
+
+        _shutil.move(str(opencode_bin), str(opencode_real))
+        opencode_bin.write_text(
+            "#!/bin/sh\n"
+            "unset DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET\n"
+            'exec "$(dirname "$0")/_opencode_real" "$@"\n'
+        )
+        opencode_bin.chmod(0o755)
+        logger.info(f"  Converted to wrapper pattern: {opencode_bin}")
 
 # 2. Write minimal opencode.json config
 # The fork's native Databricks provider auto-discovers models from serving endpoints

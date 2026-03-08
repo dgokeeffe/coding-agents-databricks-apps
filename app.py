@@ -14,7 +14,8 @@ import copy
 import logging
 import shutil
 import sys
-from flask import Flask, send_from_directory, request, jsonify
+from flask import Flask, send_from_directory, request, jsonify, session
+from werkzeug.utils import secure_filename
 from collections import deque
 
 from utils import resolve_auth, AuthMode, TokenRefresher
@@ -24,7 +25,6 @@ from state_sync import save_state, restore_state, start_periodic_sync
 SESSION_TIMEOUT_SECONDS = 120  # No poll for 120s = dead PTY wrapper (tmux persists)
 CLEANUP_INTERVAL_SECONDS = 30  # How often to check for stale sessions
 GRACEFUL_SHUTDOWN_WAIT = 3  # Seconds to wait after SIGHUP before SIGKILL
-
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +36,17 @@ app.secret_key = os.urandom(24)
 # Store sessions: {session_id: {"master_fd": fd, "pid": pid, "output_buffer": deque}}
 sessions = {}
 sessions_lock = threading.Lock()
+
+# SIGTERM graceful shutdown: notify clients before gunicorn stops the worker
+shutting_down = False
+
+def handle_sigterm(signum, frame):
+    """Notify clients that app is shutting down, then let gunicorn handle the rest."""
+    global shutting_down
+    shutting_down = True
+    logger.info("SIGTERM received — setting shutting_down flag for clients")
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 # Setup state tracking
 setup_lock = threading.Lock()
@@ -112,6 +123,14 @@ setup_state = {
         {
             "id": "databricks",
             "label": "Setting up Databricks CLI",
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+        },
+        {
+            "id": "mlflow",
+            "label": "Enabling MLflow tracing",
             "status": "pending",
             "started_at": None,
             "completed_at": None,
@@ -369,6 +388,29 @@ def _setup_git_config():
         f.write("set -g history-limit 10000\n")
         f.write("set -g mouse on\n")
 
+    # Reinit app source git to remove template origin (Databricks Apps only)
+    _reinit_app_git()
+
+
+def _reinit_app_git():
+    """On Databricks Apps, reinit git to remove template origin remote."""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    if app_dir != "/app/python/source_code":
+        return  # Local dev — leave git intact
+
+    git_dir = os.path.join(app_dir, ".git")
+    if not os.path.isdir(git_dir):
+        return  # Already clean
+
+    shutil.rmtree(git_dir)
+    subprocess.run(["git", "init"], cwd=app_dir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=app_dir, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Initial commit from coding-agents template"],
+        cwd=app_dir, capture_output=True,
+    )
+    logger.info("Reinitialized app source git (template origin removed)")
+
 
 def _clone_git_repos():
     """Clone repos listed in GIT_REPOS env var into ~/projects/."""
@@ -507,6 +549,7 @@ def run_setup():
     _run_step("opencode", [py, "setup_opencode.py"])
     _run_step("gemini", [py, "setup_gemini.py"])
     _run_step("databricks", [py, "setup_databricks.py"])
+    _run_step("mlflow", [py, "setup_mlflow.py"])
 
     # Clone git repos specified in GIT_REPOS env var
     _clone_git_repos()
@@ -664,14 +707,17 @@ def cleanup_stale_sessions():
 
         now = time.time()
         stale_sessions = []
+        warning_threshold = SESSION_TIMEOUT_SECONDS * 0.8
 
-        # Find stale sessions
         with sessions_lock:
             for session_id, session in sessions.items():
-                if now - session["last_poll_time"] > SESSION_TIMEOUT_SECONDS:
+                idle = now - session["last_poll_time"]
+                if idle > SESSION_TIMEOUT_SECONDS:
                     stale_sessions.append(
                         (session_id, session["pid"], session["master_fd"])
                     )
+                elif idle > warning_threshold:
+                    session["timeout_warning"] = True
 
         if stale_sessions:
             logger.info(f"Found {len(stale_sessions)} stale session(s) to clean up")
@@ -789,6 +835,9 @@ def create_session():
         # Set up environment for the shell
         shell_env = os.environ.copy()
         shell_env["TERM"] = "xterm-256color"
+        # Remove Claude Code env vars so the browser terminal isn't seen as nested
+        shell_env.pop("CLAUDECODE", None)
+        shell_env.pop("CLAUDE_CODE_SESSION", None)
         # Ensure HOME is set correctly
         if not shell_env.get("HOME") or shell_env["HOME"] == "/":
             shell_env["HOME"] = "/app/python/source_code"
@@ -882,6 +931,36 @@ def send_input():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/upload", methods=["POST"])
+def upload_file():
+    """Save an uploaded file (e.g. clipboard image) and return its path."""
+    logger.info(f"Upload request: content_type={request.content_type}, content_length={request.content_length}")
+
+    if "file" not in request.files:
+        logger.warning(f"Upload missing 'file' key. Keys: {list(request.files.keys())}")
+        return jsonify({"error": "No file provided"}), 400
+
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    logger.info(f"Upload file: name={f.filename}, content_type={f.content_type}")
+
+    home = os.environ.get("HOME", "/app/python/source_code")
+    if not home or home == "/":
+        home = "/app/python/source_code"
+    upload_dir = os.path.join(home, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    safe_name = f"{uuid.uuid4().hex[:8]}_{secure_filename(f.filename)}"
+    file_path = os.path.join(upload_dir, safe_name)
+    f.save(file_path)
+
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    logger.info(f"Upload saved: {file_path} ({file_size} bytes)")
+    return jsonify({"path": file_path})
+
+
 @app.route("/api/output", methods=["POST"])
 def get_output():
     """Get output from the terminal."""
@@ -898,8 +977,23 @@ def get_output():
         output = "".join(buffer)
         buffer.clear()
         exited = session.get("exited", False)
+        timeout_warning = session.pop("timeout_warning", False)
 
-    return jsonify({"output": output, "exited": exited})
+    return jsonify({"output": output, "exited": exited, "shutting_down": shutting_down, "timeout_warning": timeout_warning})
+
+
+@app.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    """Lightweight keep-alive — resets timeout without draining output buffer."""
+    data = request.json
+    session_id = data.get("session_id")
+    with sessions_lock:
+        if session_id not in sessions:
+            return jsonify({"error": "Session not found"}), 404
+        session = sessions[session_id]
+        session["last_poll_time"] = time.time()
+        timeout_warning = session.pop("timeout_warning", False)
+    return jsonify({"status": "ok", "timeout_warning": timeout_warning})
 
 
 @app.route("/api/output-batch", methods=["POST"])
@@ -1002,6 +1096,7 @@ def initialize_app():
     app_owner = _get_app_owner(auth)
     if app_owner:
         logger.info(f"App owner (from token): {app_owner}")
+        os.environ["APP_OWNER"] = app_owner
     else:
         logger.warning("Could not determine app owner - authorization disabled")
 

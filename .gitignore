@@ -4,9 +4,16 @@ __pycache__/
 .env
 .venv/
 venv/
+outstanding-todos.md
 
 # Workspace-specific config (use app.yaml.template)
 # app.yaml
 
 # Git worktrees
 .worktrees/
+
+# Human tokens (brainstorming notes)
+.humantokens/
+
+# Uploaded files (clipboard paste images)
+uploads/

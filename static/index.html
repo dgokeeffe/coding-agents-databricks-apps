@@ -173,6 +173,7 @@
   <div id="pane-container" class="layout-single" role="main" aria-label="Terminal panes"></div>
   <div id="status" aria-live="polite">Loading...</div>
 
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="/static/lib/xterm.js"></script>
   <script src="/static/lib/addon-fit.js"></script>
   <script src="/static/lib/addon-web-links.js"></script>
@@ -267,28 +268,41 @@
           if (!this.sessionId) return;
           // Drop OSC responses: \x1b] ... \x1b\ or \x1b] ... \x07
           if (/\x1b\]/.test(input)) return;
-          fetch('/api/input', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: this.sessionId, input: input })
-          }).catch(err => console.warn('Input send failed:', err));
+          // Use WebSocket if connected, else HTTP fallback
+          if (window._wsConnected && window._socket) {
+            window._socket.emit('terminal_input', { session_id: this.sessionId, input: input });
+          } else {
+            fetch('/api/input', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: this.sessionId, input: input })
+            }).catch(err => console.warn('Input send failed:', err));
+          }
         });
       }
 
       async sendResize() {
         if (!this.sessionId || !this.term) return;
-        try {
-          await fetch('/api/resize', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              session_id: this.sessionId,
-              cols: this.term.cols,
-              rows: this.term.rows
-            })
+        if (window._wsConnected && window._socket) {
+          window._socket.emit('terminal_resize', {
+            session_id: this.sessionId,
+            cols: this.term.cols,
+            rows: this.term.rows
           });
-        } catch (err) {
-          console.warn('Resize failed:', err);
+        } else {
+          try {
+            await fetch('/api/resize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                session_id: this.sessionId,
+                cols: this.term.cols,
+                rows: this.term.rows
+              })
+            });
+          } catch (err) {
+            console.warn('Resize failed:', err);
+          }
         }
       }
 
@@ -316,6 +330,10 @@
       async destroy() {
         this.alive = false;
         if (this.sessionId) {
+          // Leave WebSocket room if connected
+          if (window._wsConnected && window._socket) {
+            window._socket.emit('leave_session', { session_id: this.sessionId });
+          }
           try {
             navigator.sendBeacon(
               '/api/session/close',
@@ -396,13 +414,73 @@
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => this.cleanup());
 
+        // Initialize WebSocket connection (falls back to HTTP polling)
+        this.initWebSocket();
+
         // Check for existing tmux sessions to restore
         await this.restoreOrCreate();
 
-        // Start adaptive batch polling
+        // Start adaptive batch polling (serves as fallback when WebSocket is down)
         this.startPolling();
 
         this.updateIndicators();
+      }
+
+      initWebSocket() {
+        if (typeof io === 'undefined') {
+          console.log('[ws] Socket.IO client not available, using HTTP polling');
+          return;
+        }
+
+        const socket = io({ transports: ['websocket', 'polling'] });
+        window._socket = socket;
+        window._wsConnected = false;
+
+        socket.on('connect', () => {
+          console.log('[ws] Connected');
+          window._wsConnected = true;
+          // Re-join rooms for all active panes and stop HTTP polling
+          for (const [idx, pane] of this.panes) {
+            if (pane && pane.sessionId) {
+              socket.emit('join_session', { session_id: pane.sessionId });
+            }
+          }
+          if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = null;
+          }
+        });
+
+        socket.on('disconnect', (reason) => {
+          console.log('[ws] Disconnected:', reason);
+          window._wsConnected = false;
+          // Fall back to HTTP polling
+          this.startPolling();
+        });
+
+        socket.on('connect_error', (err) => {
+          console.log('[ws] Connection error:', err.message);
+          window._wsConnected = false;
+          if (!this.pollTimer) this.startPolling();
+        });
+
+        // Receive terminal output pushed from server
+        socket.on('terminal_output', (data) => {
+          for (const [idx, pane] of this.panes) {
+            if (pane && pane.sessionId === data.session_id && data.output) {
+              pane.writeOutput(data.output);
+            }
+          }
+        });
+
+        // Receive session exited notification
+        socket.on('session_exited', (data) => {
+          for (const [idx, pane] of this.panes) {
+            if (pane && pane.sessionId === data.session_id) {
+              pane.markExited();
+            }
+          }
+        });
       }
 
       async restoreOrCreate() {
@@ -539,6 +617,11 @@
         const pane = new TerminalPane(index);
         this.panes.set(index, pane);
         await pane.init(this.container);
+
+        // Join WebSocket room if connected
+        if (window._wsConnected && window._socket && pane.sessionId) {
+          window._socket.emit('join_session', { session_id: pane.sessionId });
+        }
 
         // Reorder DOM children to match slot order
         this.reorderSlots();

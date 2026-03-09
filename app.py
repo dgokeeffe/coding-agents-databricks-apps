@@ -14,7 +14,9 @@ import copy
 import logging
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, send_from_directory, request, jsonify, session
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.utils import secure_filename
 from collections import deque
 
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = os.urandom(24)
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 # Store sessions: {session_id: {"master_fd": fd, "pid": pid, "output_buffer": deque}}
 sessions = {}
@@ -551,12 +554,23 @@ def run_setup():
     )
     # Use the currently running interpreter instead of assuming `python` exists in PATH.
     py = sys.executable or "python"
-    _run_step("claude", [py, "setup_claude.py"])
-    _run_step("codex", [py, "setup_codex.py"])
-    _run_step("opencode", [py, "setup_opencode.py"])
-    _run_step("gemini", [py, "setup_gemini.py"])
-    _run_step("databricks", [py, "setup_databricks.py"])
-    _run_step("mlflow", [py, "setup_mlflow.py"])
+
+    # --- Parallel agent setup (all independent of each other) ---
+    parallel_steps = [
+        ("claude",     [py, "setup_claude.py"]),
+        ("codex",      [py, "setup_codex.py"]),
+        ("opencode",   [py, "setup_opencode.py"]),
+        ("gemini",     [py, "setup_gemini.py"]),
+        ("databricks", [py, "setup_databricks.py"]),
+        ("mlflow",     [py, "setup_mlflow.py"]),
+    ]
+
+    with ThreadPoolExecutor(max_workers=len(parallel_steps)) as executor:
+        futures = [
+            executor.submit(_run_step, step_id, command)
+            for step_id, command in parallel_steps
+        ]
+        wait(futures)
 
     # Clone git repos specified in GIT_REPOS env var
     _clone_git_repos()
@@ -659,11 +673,17 @@ def read_pty_output(session_id, fd):
                 if not output:
                     # EOF — process exited
                     break
+                decoded = output.decode(errors="replace")
                 with sessions_lock:
                     if session_id in sessions:
-                        sessions[session_id]["output_buffer"].append(
-                            output.decode(errors="replace")
-                        )
+                        sessions[session_id]["output_buffer"].append(decoded)
+                # Push via WebSocket to the session room
+                try:
+                    socketio.emit('terminal_output',
+                                  {'session_id': session_id, 'output': decoded},
+                                  room=session_id)
+                except Exception:
+                    pass  # No WebSocket clients — HTTP polling handles it
             else:
                 # select timed out — check if process is still alive
                 try:
@@ -682,6 +702,11 @@ def read_pty_output(session_id, fd):
         if session_id in sessions:
             sessions[session_id]["exited"] = True
             logger.info(f"Session {session_id} process exited")
+    # Notify WebSocket clients
+    try:
+        socketio.emit('session_exited', {'session_id': session_id}, room=session_id)
+    except Exception:
+        pass
 
 
 def terminate_session(session_id, pid, master_fd):
@@ -1088,6 +1113,70 @@ def close_session():
     return jsonify({"status": "ok"})
 
 
+# ── WebSocket event handlers ────────────────────────────────────────────────
+
+@socketio.on('join_session')
+def handle_join_session(data):
+    """Client joins a session room to receive real-time output."""
+    session_id = data.get('session_id')
+    if not session_id:
+        return
+    with sessions_lock:
+        if session_id not in sessions:
+            return
+        sessions[session_id]["last_poll_time"] = time.time()
+    join_room(session_id)
+
+
+@socketio.on('leave_session')
+def handle_leave_session(data):
+    """Client leaves a session room."""
+    session_id = data.get('session_id')
+    if session_id:
+        leave_room(session_id)
+
+
+@socketio.on('terminal_input')
+def handle_terminal_input(data):
+    """Receive terminal input via WebSocket."""
+    session_id = data.get('session_id')
+    input_data = data.get('input', '')
+    if not session_id or len(input_data) > 4096:
+        return
+
+    with sessions_lock:
+        if session_id not in sessions:
+            return
+        fd = sessions[session_id]["master_fd"]
+        sessions[session_id]["last_poll_time"] = time.time()
+
+    try:
+        os.write(fd, input_data.encode())
+    except OSError:
+        pass
+
+
+@socketio.on('terminal_resize')
+def handle_terminal_resize(data):
+    """Resize terminal via WebSocket."""
+    session_id = data.get('session_id')
+    cols = data.get('cols', 80)
+    rows = data.get('rows', 24)
+    if not session_id or not isinstance(cols, int) or not isinstance(rows, int):
+        return
+
+    with sessions_lock:
+        if session_id not in sessions:
+            return
+        fd = sessions[session_id]["master_fd"]
+
+    try:
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        pass
+
+
 def initialize_app():
     """One-time init: resolve auth, detect owner, start cleanup + token refresh."""
     global app_owner, token_refresher
@@ -1140,4 +1229,4 @@ if __name__ == "__main__":
     # Local dev only — production uses gunicorn
     initialize_app()
     port = int(os.environ.get("DATABRICKS_APP_PORT", 8000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    socketio.run(app, host="0.0.0.0", port=port)

@@ -437,8 +437,10 @@
         // Check for existing tmux sessions to restore
         await this.restoreOrCreate();
 
-        // Start adaptive batch polling (serves as fallback when WebSocket is down)
-        this.startPolling();
+        // Start adaptive batch polling only if WebSocket isn't already handling output
+        if (!window._wsRealWebSocket) {
+          this.startPolling();
+        }
 
         this.updateIndicators();
       }
@@ -752,6 +754,9 @@
       }
 
       async batchPoll() {
+        // Skip polling when WebSocket is delivering output (prevents duplication)
+        if (window._wsRealWebSocket) return;
+
         const sessionIds = [];
         const paneMap = new Map(); // sessionId -> pane
 

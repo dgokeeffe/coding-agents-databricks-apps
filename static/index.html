@@ -173,7 +173,7 @@
   <div id="pane-container" class="layout-single" role="main" aria-label="Terminal panes"></div>
   <div id="status" aria-live="polite">Loading...</div>
 
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="/static/socket.io.min.js"></script>
   <script src="/static/lib/xterm.js"></script>
   <script src="/static/lib/addon-fit.js"></script>
   <script src="/static/lib/addon-web-links.js"></script>
@@ -264,22 +264,36 @@
         // Input handler — filter out OSC responses (e.g. color query replies like \e]11;rgb:...\e\)
         // that xterm.js generates in response to shell/readline queries. Without filtering,
         // these leak into the PTY input buffer and corrupt commands.
+        this._inputQueue = '';
+        this._inputFlushScheduled = false;
         this.term.onData(input => {
           if (!this.sessionId) return;
           // Drop OSC responses: \x1b] ... \x1b\ or \x1b] ... \x07
           if (/\x1b\]/.test(input)) return;
-          // Use true WebSocket if available, else HTTP POST (always prefer HTTP
-          // over SocketIO long-polling — simpler and lower overhead)
+          // Use true WebSocket if available (instant, no batching needed)
           if (window._wsRealWebSocket && window._socket) {
             window._socket.emit('terminal_input', { session_id: this.sessionId, input: input });
-          } else {
-            fetch('/api/input', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ session_id: this.sessionId, input: input })
-            }).then(resp => resp.json()).then(data => {
-              if (data.output) this.writeOutput(data.output);
-            }).catch(err => console.warn('Input send failed:', err));
+            return;
+          }
+          // HTTP path: batch keystrokes within one animation frame (~16ms)
+          // to reduce round trips through the Azure proxy (~340ms each)
+          this._inputQueue += input;
+          if (!this._inputFlushScheduled) {
+            this._inputFlushScheduled = true;
+            const pane = this;
+            requestAnimationFrame(() => {
+              const batch = pane._inputQueue;
+              pane._inputQueue = '';
+              pane._inputFlushScheduled = false;
+              if (!batch || !pane.sessionId) return;
+              fetch('/api/input', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: pane.sessionId, input: batch })
+              }).then(resp => resp.json()).then(data => {
+                if (data.output) pane.writeOutput(data.output);
+              }).catch(err => console.warn('Input send failed:', err));
+            });
           }
         });
       }

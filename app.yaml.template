@@ -38,3 +38,11 @@ env:
   # Default: true (set to "false" to disable)
   # - name: STATE_SYNC
   #   value: "true"
+  #OPTIONAL: Terminal UI mode. "tabs" (default) shows browser-like tabs; "grid" shows
+  # the multi-pane grid layout. Users can toggle between modes in the UI.
+  # - name: TERMINAL_MODE
+  #   value: "tabs"
+  #OPTIONAL: Enable tmux session persistence. When true (default), terminal sessions
+  # survive page refreshes via tmux. Set to "false" to use plain PTY sessions.
+  # - name: TMUX_ENABLED
+  #   value: "true"

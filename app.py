@@ -29,7 +29,7 @@ CLEANUP_INTERVAL_SECONDS = 30  # How often to check for stale sessions
 GRACEFUL_SHUTDOWN_WAIT = 3  # Seconds to wait after SIGHUP before SIGKILL
 
 # Terminal mode configuration
-TMUX_ENABLED = os.environ.get('TMUX_ENABLED', 'true').lower() == 'true'
+TMUX_ENABLED = os.environ.get('TMUX_ENABLED', 'false').lower() == 'true'
 TERMINAL_MODE = os.environ.get('TERMINAL_MODE', 'tabs')
 
 # Logging setup
@@ -926,7 +926,7 @@ def create_session():
         # Use tmux for session persistence across page refreshes.
         # tmux new-session -A: attach if session exists, create if not.
         # Re-read TMUX_ENABLED at request time so tests can toggle it via env.
-        tmux_enabled_now = os.environ.get('TMUX_ENABLED', 'true').lower() == 'true'
+        tmux_enabled_now = os.environ.get('TMUX_ENABLED', 'false').lower() == 'true'
         tmux_session = f"pane-{pane_id}"
         reattached = False
         if tmux_enabled_now and shutil.which("tmux"):

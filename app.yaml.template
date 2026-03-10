@@ -42,7 +42,7 @@ env:
   # the multi-pane grid layout. Users can toggle between modes in the UI.
   # - name: TERMINAL_MODE
   #   value: "tabs"
-  #OPTIONAL: Enable tmux session persistence. When true (default), terminal sessions
-  # survive page refreshes via tmux. Set to "false" to use plain PTY sessions.
+  #OPTIONAL: Enable tmux session persistence. When "true", terminal sessions
+  # survive page refreshes via tmux. Default: "false" (plain PTY, lighter weight).
   # - name: TMUX_ENABLED
-  #   value: "true"
+  #   value: "false"
